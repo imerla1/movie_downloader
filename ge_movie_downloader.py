@@ -68,7 +68,7 @@ class GEMovieDownloader:
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "gzip, deflate",  # Removed 'br' (brotli) as requests doesn't handle it by default
         "sec-ch-ua": '"Brave";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"macOS"',
@@ -412,6 +412,33 @@ class GEMovieDownloader:
         print(f"  Failed: {failed}")
         print(f"  Output directory: {series_dir}")
 
+    def extract_movie_video_url(self, embed_html: str, preferred_lang: str = "GEO") -> Optional[str]:
+        """Extract movie video URL from embed page with language preference."""
+        # Pattern for language-labeled URLs in movie embeds
+        # Format: {ქართულად}url_geo or similar
+        lang_patterns = {
+            'GEO': r'\{ქართულად\}(https?://[^;{\s"\']+)',
+            'ENG': r'\{ინგლისურად\}(https?://[^;{\s"\']+)',
+            'RUS': r'\{რუსულად\}(https?://[^;{\s"\']+)',
+        }
+
+        # Try preferred language first
+        if preferred_lang in lang_patterns:
+            match = re.search(lang_patterns[preferred_lang], embed_html)
+            if match:
+                return match.group(1)
+
+        # Try other languages as fallback
+        for lang, pattern in lang_patterns.items():
+            if lang != preferred_lang:
+                match = re.search(pattern, embed_html)
+                if match:
+                    print(f"  Note: {preferred_lang} not available, using {lang}")
+                    return match.group(1)
+
+        # Fallback to basic extraction
+        return self.extract_video_url(embed_html)
+
     def download_movie(self, url: str, language: str = "GEO"):
         """Download a movie."""
         # Parse URL
@@ -434,27 +461,88 @@ class GEMovieDownloader:
 
         print(f"Title: {title_clean} / {title_en} ({year})")
 
-        # Extract TMDB ID from embed iframe
-        iframe = soup.find('iframe', id='movie_embed')
+        # Extract TMDB ID from embed iframe - try multiple patterns
+        iframe = soup.find('iframe', id='emplayer')  # Common movie iframe ID
         if not iframe:
-            # Try alternative iframe IDs
+            iframe = soup.find('iframe', id='movie_embed')
+        if not iframe:
+            # Try alternative: any iframe with player.php or splayer.php
+            iframe = soup.find('iframe', src=re.compile(r'player\.php'))
+        if not iframe:
             iframe = soup.find('iframe', src=re.compile(r'splayer\.php'))
+        if not iframe:
+            # Try finding any iframe
+            iframe = soup.find('iframe')
 
         tmdb_id = None
+        embed_base = None
+        embed_type = "splayer"  # Default embed type
+
         if iframe and iframe.get('src'):
-            tmdb_match = re.search(r'id=(\d+)', iframe['src'])
+            iframe_src = iframe['src']
+            print(f"Found iframe: {iframe_src[:100]}...")
+            tmdb_match = re.search(r'id=(\d+)', iframe_src)
             if tmdb_match:
                 tmdb_id = tmdb_match.group(1)
+            # Extract embed base URL
+            base_match = re.match(r'(https?://[^/]+)', iframe_src)
+            if base_match:
+                embed_base = base_match.group(1)
+            # Detect embed type (player.php vs splayer.php)
+            if 'player.php' in iframe_src and 'splayer.php' not in iframe_src:
+                embed_type = "player"
+
+        # Fallback: search for TMDB ID in the HTML
+        if not tmdb_id:
+            # Look in script tags or data attributes
+            tmdb_patterns = [
+                r'tmdb_id["\']?\s*[=:]\s*["\']?(\d+)',
+                r'"id"\s*:\s*(\d+)',
+                r'tmdb["\']?\s*[=:]\s*["\']?(\d+)',
+            ]
+            for pattern in tmdb_patterns:
+                match = re.search(pattern, html)
+                if match:
+                    tmdb_id = match.group(1)
+                    break
 
         if not tmdb_id:
             print("Error: Could not find TMDB ID")
             return
 
         print(f"TMDB ID: {tmdb_id}")
+        print(f"Embed type: {embed_type}")
 
-        # Fetch embed page and get video URL
-        embed_html = self.fetch_movie_embed_page(tmdb_id, slug)
-        video_url = self.extract_video_url(embed_html)
+        # Try multiple embed URLs
+        embed_bases = []
+        if embed_base:
+            embed_bases.append(embed_base)
+        embed_bases.extend([
+            "https://embed.filmix.bond",
+            "https://embed.kinoflix.stream",
+            "https://embed.kinoflix.live",
+            "https://embed.kinoflix.co",
+        ])
+
+        video_url = None
+        for base in embed_bases:
+            try:
+                # Use the detected embed type (player.php or splayer.php)
+                php_file = "player.php" if embed_type == "player" else "splayer.php"
+                embed_url = f"{base}/{php_file}?type=movie&id={tmdb_id}&name={slug}&r_d=on&v=2.5.6"
+                print(f"  Trying: {embed_url[:80]}...")
+                headers = self.HEADERS.copy()
+                headers["Referer"] = f"{self.BASE_URL}/"
+                response = self.session.get(embed_url, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    embed_html = response.text
+                    video_url = self.extract_movie_video_url(embed_html, language)
+                    if video_url:
+                        print(f"  Found video URL!")
+                        break
+            except Exception as e:
+                print(f"  Failed with {base}: {e}")
+                continue
 
         if not video_url:
             print("Error: Could not find video URL")
