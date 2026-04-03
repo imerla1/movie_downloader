@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-GE.Movie TV Series Downloader v2
-Enhanced version with direct CDN URL construction based on observed patterns.
-
-Video URL Pattern discovered from HAR:
-https://01-cdn.videodb.cloud/serials/{MM_YY}/{Title}_{Year}_SE{Season}/{Title}_{Year}_SE{Season}_EP{Episode}_{LANG}.mp4?hash={hash}&expires={timestamp}
+GE.Movie Downloader v2
+Enhanced version for downloading movies and TV series from ge.movie.
 
 Usage:
-    python ge_movie_downloader_v2.py <series_url> [options]
+    python ge_movie_downloader_v2.py <url> [options]
+
+Examples:
+    # Movies:
+    python ge_movie_downloader_v2.py "https://ge.movie/movie/49614/sinners"
+    python ge_movie_downloader_v2.py "https://ge.movie/movie/49614/sinners" -l GEO
+
+    # TV Series:
+    python ge_movie_downloader_v2.py "https://ge.movie/serial/49495/the-penguin"
+    python ge_movie_downloader_v2.py "https://ge.movie/serial/49495/the-penguin" -s 1 -e 3
 """
 
 import argparse
@@ -102,6 +108,15 @@ class GEMovieDownloaderV2:
         """Print verbose messages."""
         if self.verbose:
             print(f"[DEBUG] {message}")
+
+    def parse_url(self, url: str) -> tuple[str, str, str]:
+        """Extract content type, ID and slug from URL.
+        Returns: (content_type, id, slug) where content_type is 'movie' or 'serial'
+        """
+        match = re.search(r'/(movie|serial)/(\d+)/([^/?]+)', url)
+        if not match:
+            raise ValueError(f"Invalid URL: {url}")
+        return match.group(1), match.group(2), match.group(3)
 
     def parse_series_url(self, url: str) -> tuple[str, str]:
         """Extract series ID and slug from URL."""
@@ -211,7 +226,45 @@ class GEMovieDownloaderV2:
 
         return None
 
-    def parse_playlist(self, embed_html: str) -> dict:
+    def _parse_file_string(self, file_str: str, preferred_quality: str = "HD") -> dict:
+        """Parse a file string with quality blocks into {language: url} dict.
+
+        Format: [SD]{რუსულად}url;{ქართულად}url;,[HD]{რუსულად}url;{ქართულად}url;
+        """
+        lang_map = {
+            'GEO': 'ქართულად',
+            'ENG': 'ინგლისურად',
+            'RUS': 'რუსულად',
+        }
+
+        # Try to parse quality blocks first
+        quality_blocks = {}
+        for block_match in re.finditer(r'\[(\w+)\]((?:(?!\[).)+)', file_str):
+            quality = block_match.group(1)
+            block = block_match.group(2)
+            quality_blocks[quality] = {}
+            for lang_code, lang_name in lang_map.items():
+                lang_pattern = re.compile(r'\{' + re.escape(lang_name) + r'\}(https?://[^;{\s"\']+)')
+                url_match = lang_pattern.search(block)
+                if url_match:
+                    quality_blocks[quality][lang_code] = url_match.group(1)
+
+        if quality_blocks:
+            # Return URLs from preferred quality, fallback to other
+            for quality in [preferred_quality] + [q for q in quality_blocks if q != preferred_quality]:
+                if quality in quality_blocks and quality_blocks[quality]:
+                    return quality_blocks[quality]
+
+        # Fallback: no quality blocks, just extract language URLs directly
+        urls = {}
+        for lang_code, lang_name in lang_map.items():
+            lang_pattern = re.compile(r'\{' + re.escape(lang_name) + r'\}(https?://[^;{\s"\']+)')
+            url_match = lang_pattern.search(file_str)
+            if url_match:
+                urls[lang_code] = url_match.group(1)
+        return urls
+
+    def parse_playlist(self, embed_html: str, preferred_quality: str = "HD") -> dict:
         """
         Parse the Playerjs playlist from embed page.
         Returns: {(season, episode): {language: url, ...}, ...}
@@ -230,24 +283,7 @@ class GEMovieDownloaderV2:
             season = int(match.group(2))
             episode = int(match.group(3))
 
-            # Parse the file string to extract URLs by language
-            # Format: [HD]{ქართულად}url_geo;{ინგლისურად}url_eng;,[SD]...
-            urls = {}
-
-            # Extract Georgian URLs (GEO)
-            geo_match = re.search(r'\{ქართულად\}(https?://[^;{]+)', file_str)
-            if geo_match:
-                urls['GEO'] = geo_match.group(1)
-
-            # Extract English URLs (ENG)
-            eng_match = re.search(r'\{ინგლისურად\}(https?://[^;{]+)', file_str)
-            if eng_match:
-                urls['ENG'] = eng_match.group(1)
-
-            # Extract Russian URLs (RUS) if present
-            rus_match = re.search(r'\{რუსულად\}(https?://[^;{]+)', file_str)
-            if rus_match:
-                urls['RUS'] = rus_match.group(1)
+            urls = self._parse_file_string(file_str, preferred_quality)
 
             if urls:
                 episodes[(season, episode)] = urls
@@ -255,7 +291,7 @@ class GEMovieDownloaderV2:
 
         return episodes
 
-    def extract_video_urls(self, embed_html: str) -> list[dict]:
+    def extract_video_urls(self, embed_html: str, preferred_quality: str = "HD") -> list[dict]:
         """
         Extract all video URLs from embed page.
         Returns list of {url, quality, language} dicts.
@@ -263,7 +299,7 @@ class GEMovieDownloaderV2:
         videos = []
 
         # Parse the playlist structure
-        playlist = self.parse_playlist(embed_html)
+        playlist = self.parse_playlist(embed_html, preferred_quality)
 
         # Convert to list format
         for (season, episode), urls in playlist.items():
@@ -316,14 +352,15 @@ class GEMovieDownloaderV2:
         slug: str,
         season: int,
         episode: int,
-        preferred_lang: str = "GEO"
+        preferred_lang: str = "GEO",
+        preferred_quality: str = "HD"
     ) -> Optional[str]:
         """Get the direct video URL for a specific episode."""
         embed_html = self.fetch_embed_page(tmdb_id, slug, season, episode)
         if not embed_html:
             return None
 
-        videos = self.extract_video_urls(embed_html)
+        videos = self.extract_video_urls(embed_html, preferred_quality)
         if not videos:
             self.log("No videos found in embed page")
             # Save embed HTML for debugging
@@ -475,12 +512,192 @@ class GEMovieDownloaderV2:
             print(f"  Resume error: {e}")
             return False
 
+    def fetch_movie_embed_page(self, iframe_src: str, tmdb_id: str, slug: str) -> Optional[str]:
+        """Fetch the embed player page for a movie.
+        First tries the actual iframe src URL, then falls back to constructed URLs.
+        """
+        headers = self.HEADERS.copy()
+        headers["Referer"] = f"{self.BASE_URL}/"
+
+        # Try the actual iframe src first (most reliable)
+        if iframe_src:
+            self.log(f"Trying actual iframe src: {iframe_src}")
+            try:
+                response = self.session.get(iframe_src, headers=headers, timeout=15)
+                if response.status_code == 200 and len(response.text) > 200:
+                    return response.text
+            except Exception as e:
+                self.log(f"Failed with iframe src: {e}")
+
+        # Fallback: try constructed URLs
+        for embed_base in self.EMBED_URLS:
+            for php_file in ["movie_player_4.php", "splayer.php", "player.php"]:
+                url = f"{embed_base}/{php_file}?type=movie&id={tmdb_id}&name={slug}&r_d=on&v=2.5.6"
+                self.log(f"Trying movie embed URL: {url}")
+                try:
+                    response = self.session.get(url, headers=headers, timeout=10)
+                    if response.status_code == 200 and len(response.text) > 200:
+                        return response.text
+                except Exception as e:
+                    self.log(f"Failed: {e}")
+                    continue
+        return None
+
+    def extract_movie_video_url(self, embed_html: str, preferred_lang: str = "GEO", preferred_quality: str = "HD") -> Optional[str]:
+        """Extract movie video URL from embed page with language and quality preference."""
+        # Extract the full "file" string
+        file_match = re.search(r'"file"\s*:\s*"([^"]+)"', embed_html)
+        if not file_match:
+            if re.search(r'"file"\s*:\s*\[\s*\]', embed_html):
+                print("  Note: Video file list is empty - movie may not be available yet")
+            return None
+
+        file_str = file_match.group(1)
+        self.log(f"File string: {file_str[:200]}...")
+
+        urls = self._parse_file_string(file_str, preferred_quality)
+
+        if urls:
+            if preferred_lang in urls:
+                print(f"  Found: {preferred_quality} / {preferred_lang}")
+                return urls[preferred_lang]
+            # Fallback to any available language
+            for lang in ['GEO', 'ENG', 'RUS']:
+                if lang in urls:
+                    print(f"  Note: {preferred_lang} not available, using {lang}")
+                    return urls[lang]
+
+        # Fallback: any URL from file string
+        any_url = re.search(r'(https?://[^;{\s"\']+\.mp4[^;{\s"\']*)', file_str)
+        if any_url:
+            return any_url.group(1)
+
+        return None
+
+    def download_movie(self, url: str, language: str = "GEO", quality: str = "HD"):
+        """Download a movie."""
+        print("=" * 60)
+        print("GE.Movie Downloader v2")
+        print("=" * 60)
+
+        # Parse URL
+        _, movie_id, slug = self.parse_url(url)
+        print(f"\nMovie ID: {movie_id}")
+        print(f"Slug: {slug}")
+
+        # Fetch movie page
+        print("\nFetching movie information...")
+        page_url = f"{self.BASE_URL}/movie/{movie_id}/{slug}"
+        self.log(f"Fetching: {page_url}")
+        response = self.session.get(page_url)
+        response.raise_for_status()
+        html = response.text
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # Extract title
+        title_tag = soup.find('h1')
+        title_text = title_tag.get_text(separator=' ', strip=True) if title_tag else slug
+        year_match = re.search(r'\((\d{4})\)', title_text)
+        year = year_match.group(1) if year_match else "Unknown"
+        title_ge = re.match(r'^([^\(]+)', title_text)
+        title_ge = title_ge.group(1).strip() if title_ge else title_text
+        title_en = slug.replace('-', ' ').title()
+
+        print(f"\nTitle (GE): {title_ge}")
+        print(f"Title (EN): {title_en}")
+        print(f"Year: {year}")
+
+        # Find the embed iframe - try multiple ID patterns
+        iframe = (
+            soup.find('iframe', id='emplayer') or
+            soup.find('iframe', id='movie_embed') or
+            soup.find('iframe', id='serial_embed') or
+            soup.find('iframe', src=re.compile(r'player|splayer|embed')) or
+            soup.find('iframe')
+        )
+
+        tmdb_id = None
+        iframe_src = None
+
+        if iframe and iframe.get('src'):
+            iframe_src = iframe['src']
+            self.log(f"Embed iframe src: {iframe_src}")
+
+            # Make sure iframe src is absolute
+            if iframe_src.startswith('//'):
+                iframe_src = 'https:' + iframe_src
+            elif iframe_src.startswith('/'):
+                iframe_src = f"{self.BASE_URL}{iframe_src}"
+
+            tmdb_match = re.search(r'id=(\d+)', iframe_src)
+            if tmdb_match:
+                tmdb_id = tmdb_match.group(1)
+
+            # Add discovered embed base
+            embed_base_match = re.match(r'(https?://[^/]+)', iframe_src)
+            if embed_base_match:
+                discovered_base = embed_base_match.group(1)
+                if discovered_base not in self.EMBED_URLS:
+                    self.EMBED_URLS.insert(0, discovered_base)
+
+        if not tmdb_id:
+            for pattern in [r'tmdb_id["\']?\s*[=:]\s*["\']?(\d+)', r'"id"\s*:\s*(\d+)']:
+                match = re.search(pattern, html)
+                if match:
+                    tmdb_id = match.group(1)
+                    break
+
+        if not tmdb_id:
+            print("\nError: Could not determine TMDB ID")
+            return False
+
+        print(f"TMDB ID: {tmdb_id}")
+
+        # Fetch embed page using actual iframe src
+        print(f"\nSearching for {language} video...")
+        embed_html = self.fetch_movie_embed_page(iframe_src, tmdb_id, slug)
+        if not embed_html:
+            print("Error: Could not fetch embed page")
+            return False
+
+        if self.verbose:
+            debug_file = self.output_dir / "debug_movie_embed.html"
+            debug_file.write_text(embed_html)
+            self.log(f"Saved embed HTML to {debug_file}")
+
+        video_url = self.extract_movie_video_url(embed_html, language, quality)
+        if not video_url:
+            print("Error: Could not find video URL")
+            return False
+
+        self.log(f"Video URL: {video_url}")
+
+        # Generate filename and download
+        safe_title = re.sub(r'[<>:"/\\|?*]', '_', title_en)
+        filename = f"{safe_title}_{year}_{language}_{quality}.mp4"
+        output_path = self.output_dir / filename
+
+        print(f"\nDownloading: {filename}")
+        print(f"Output: {output_path}")
+        print("-" * 60)
+
+        if self.download_video(video_url, output_path):
+            print(f"\n{'=' * 60}")
+            print("Download Complete!")
+            print(f"  Saved to: {output_path}")
+            print("=" * 60)
+            return True
+        else:
+            print("\nDownload failed!")
+            return False
+
     def download_series(
         self,
         url: str,
         season_filter: Optional[int] = None,
         episode_filter: Optional[int] = None,
-        language: str = "GEO"
+        language: str = "GEO",
+        quality: str = "HD"
     ):
         """Download a TV series."""
         print("=" * 60)
@@ -536,6 +753,7 @@ class GEMovieDownloaderV2:
 
         print(f"\nOutput directory: {series_dir}")
         print(f"Preferred language: {language}")
+        print(f"Preferred quality: {quality}")
         print("-" * 60)
 
         # Download loop
@@ -553,7 +771,7 @@ class GEMovieDownloaderV2:
 
                 # Get video URL
                 video_url = self.get_video_url_for_episode(
-                    series.tmdb_id, slug, season_num, episode_num, language
+                    series.tmdb_id, slug, season_num, episode_num, language, quality
                 )
 
                 if not video_url:
@@ -590,16 +808,28 @@ class GEMovieDownloaderV2:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download TV series from ge.movie (v2)",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Download movies and TV series from ge.movie (v2)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Movies:
+  %(prog)s "https://ge.movie/movie/49614/sinners"
+  %(prog)s "https://ge.movie/movie/49614/sinners" -l GEO
+
+  # TV Series:
+  %(prog)s "https://ge.movie/serial/49495/the-penguin"
+  %(prog)s "https://ge.movie/serial/49495/the-penguin" -s 1 -e 3
+        """
     )
 
-    parser.add_argument("url", help="Series URL from ge.movie")
-    parser.add_argument("-s", "--season", type=int, help="Download specific season")
+    parser.add_argument("url", help="URL of the movie or series page on ge.movie")
+    parser.add_argument("-s", "--season", type=int, help="Download specific season (series only)")
     parser.add_argument("-e", "--episode", type=int, help="Download specific episode (requires -s)")
     parser.add_argument("-o", "--output", default="downloads", help="Output directory")
     parser.add_argument("-l", "--language", default="GEO",
                        choices=["GEO", "ENG", "RUS"], help="Preferred language")
+    parser.add_argument("-q", "--quality", default="HD",
+                       choices=["HD", "SD"], help="Preferred quality (default: HD)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
     args = parser.parse_args()
@@ -610,12 +840,24 @@ def main():
     downloader = GEMovieDownloaderV2(output_dir=args.output, verbose=args.verbose)
 
     try:
-        success = downloader.download_series(
-            url=args.url,
-            season_filter=args.season,
-            episode_filter=args.episode,
-            language=args.language
-        )
+        content_type, _, _ = downloader.parse_url(args.url)
+
+        if content_type == "movie":
+            if args.season or args.episode:
+                parser.error("--season and --episode are not applicable for movies")
+            success = downloader.download_movie(
+                url=args.url,
+                language=args.language,
+                quality=args.quality
+            )
+        else:
+            success = downloader.download_series(
+                url=args.url,
+                season_filter=args.season,
+                episode_filter=args.episode,
+                language=args.language,
+                quality=args.quality
+            )
         sys.exit(0 if success else 1)
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")

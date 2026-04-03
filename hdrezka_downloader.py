@@ -83,10 +83,15 @@ class HdRezkaDownloader:
     """Downloader for HDRezka website."""
 
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "*/*",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-        "Referer": "https://hdrezka.sh/",
+        "sec-ch-ua": '"Chromium";v="143", "Not A(Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
     }
 
     def __init__(self, output_dir: str = "downloads", quality: str = "1080p", parallel: int = 1):
@@ -101,7 +106,9 @@ class HdRezkaDownloader:
     def get_content_info(self, url: str, translator_priority: list = None) -> Optional[HdRezkaApi]:
         """Initialize HdRezkaApi and get content information."""
         try:
-            kwargs = {}
+            kwargs = {
+                'headers': self.HEADERS,
+            }
             if translator_priority:
                 kwargs['translators_priority'] = translator_priority
             rezka = HdRezkaApi(url, **kwargs)
@@ -151,8 +158,14 @@ class HdRezkaDownloader:
         print("\nAvailable translators and content:")
         print("-" * 60)
 
-        if hasattr(rezka, 'seriesInfo') and rezka.seriesInfo:
-            for tid, info in rezka.seriesInfo.items():
+        series_info = None
+        try:
+            series_info = rezka.seriesInfo
+        except (ValueError, AttributeError):
+            pass
+
+        if series_info:
+            for tid, info in series_info.items():
                 name = info.get('translator_name', 'Unknown')
                 premium = " [Premium]" if info.get('premium') else ""
                 seasons = info.get('seasons', {})
@@ -176,17 +189,22 @@ class HdRezkaDownloader:
 
     def get_seasons_episodes(self, rezka: HdRezkaApi, translator_id: str) -> dict:
         """Get available seasons and episodes for a specific translator."""
-        if not hasattr(rezka, 'seriesInfo') or not rezka.seriesInfo:
+        try:
+            series_info = rezka.seriesInfo
+        except (ValueError, AttributeError):
+            return {}
+
+        if not series_info:
             return {}
 
         tid = int(translator_id) if translator_id.isdigit() else translator_id
 
-        if tid in rezka.seriesInfo:
-            return rezka.seriesInfo[tid].get('episodes', {})
+        if tid in series_info:
+            return series_info[tid].get('episodes', {})
 
         # Try string key
-        if str(tid) in rezka.seriesInfo:
-            return rezka.seriesInfo[str(tid)].get('episodes', {})
+        if str(tid) in series_info:
+            return series_info[str(tid)].get('episodes', {})
 
         return {}
 
