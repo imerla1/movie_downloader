@@ -21,7 +21,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -103,6 +106,7 @@ class GEMovieDownloaderV2:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.verbose = verbose
+        self._series_iframe_template: Optional[str] = None
 
     def log(self, message: str):
         """Print verbose messages."""
@@ -174,6 +178,8 @@ class GEMovieDownloaderV2:
             tmdb_match = re.search(r'id=(\d+)', embed_url)
             if tmdb_match:
                 tmdb_id = tmdb_match.group(1)
+            # Save the full iframe URL as a template; we'll swap season/episode per-request.
+            self._series_iframe_template = embed_url
 
         # Fallback: search for TMDB ID in script tags or other places
         if not tmdb_id:
@@ -209,19 +215,71 @@ class GEMovieDownloaderV2:
         )
 
     def fetch_embed_page(self, tmdb_id: str, slug: str, season: int, episode: int) -> Optional[str]:
-        """Fetch the embed player page, trying multiple embed domains."""
-        for embed_base in self.EMBED_URLS:
-            url = f"{embed_base}/splayer.php?type=serial&id={tmdb_id}&name={slug}&season={season}&episode={episode}&r_d=on&v=2.5.6"
-            self.log(f"Trying embed URL: {url}")
+        """Fetch the embed player page, following nested iframes until a playlist is found."""
+        candidate_urls: list[str] = []
 
+        # Prefer the actual iframe URL discovered on the ge.movie page (with season/episode swapped).
+        if self._series_iframe_template:
+            templated = re.sub(r'(season=)\d+', lambda m: f"{m.group(1)}{season}", self._series_iframe_template)
+            templated = re.sub(r'(episode=)\d+', lambda m: f"{m.group(1)}{episode}", templated)
+            candidate_urls.append(templated)
+
+        # Fallback: legacy splayer.php on each known embed host.
+        for embed_base in self.EMBED_URLS:
+            candidate_urls.append(
+                f"{embed_base}/splayer.php?type=serial&id={tmdb_id}&name={slug}"
+                f"&season={season}&episode={episode}&r_d=on&v=2.5.6"
+            )
+
+        legacy_playlist_re = re.compile(r'"file"\s*:\s*"\[(?:HD|SD)\]')
+        nested_iframe_re = re.compile(r'<iframe[^>]+src=["\'](https?://[^"\']+)["\']', re.I)
+        # Playerjs config with `file: "https://.../file/play?..."` pointing at JSON playlist endpoint.
+        playerjs_file_re = re.compile(r'\bfile\s*:\s*["\'](https?://[^"\']+)["\']')
+
+        for url in candidate_urls:
+            self.log(f"Trying embed URL: {url}")
             try:
                 headers = self.HEADERS.copy()
                 headers["Referer"] = f"{self.BASE_URL}/"
-                response = self.session.get(url, headers=headers, timeout=10)
-                if response.status_code == 200:
-                    return response.text
+                response = self.session.get(url, headers=headers, timeout=15)
+                if response.status_code != 200:
+                    continue
+
+                current_url = url
+                html = response.text
+
+                # Follow nested player iframes (em.filmx.my -> videodb.stream -> ...) up to 3 hops.
+                for _ in range(3):
+                    # Legacy embed: playlist file entries are inline as [HD]/[SD] quality blocks.
+                    if legacy_playlist_re.search(html):
+                        return html
+                    # New embed: Playerjs config has a file: URL pointing at JSON playlist endpoint.
+                    pj = playerjs_file_re.search(html)
+                    if pj:
+                        json_url = pj.group(1)
+                        self.log(f"Fetching playlist JSON: {json_url}")
+                        json_headers = self.HEADERS.copy()
+                        json_headers["Referer"] = current_url
+                        json_headers["Accept"] = "*/*"
+                        json_resp = self.session.get(json_url, headers=json_headers, timeout=15)
+                        if json_resp.status_code == 200 and json_resp.text.lstrip().startswith(('[', '{')):
+                            return json_resp.text
+                    nested = nested_iframe_re.search(html)
+                    if not nested:
+                        break
+                    nested_url = nested.group(1)
+                    if not re.search(r'play|embed|video', nested_url, re.I):
+                        break
+                    self.log(f"Following nested iframe: {nested_url}")
+                    nested_headers = self.HEADERS.copy()
+                    nested_headers["Referer"] = current_url
+                    response = self.session.get(nested_url, headers=nested_headers, timeout=15)
+                    if response.status_code != 200:
+                        break
+                    current_url = nested_url
+                    html = response.text
             except Exception as e:
-                self.log(f"Failed to fetch from {embed_base}: {e}")
+                self.log(f"Failed to fetch {url}: {e}")
                 continue
 
         return None
@@ -266,25 +324,49 @@ class GEMovieDownloaderV2:
 
     def parse_playlist(self, embed_html: str, preferred_quality: str = "HD") -> dict:
         """
-        Parse the Playerjs playlist from embed page.
+        Parse the Playerjs playlist. Supports both new JSON format and legacy embed HTML.
         Returns: {(season, episode): {language: url, ...}, ...}
         """
-        episodes = {}
+        episodes: dict = {}
 
-        # Find all episode entries with file and id
-        # Order in JSON is: "file":"...", "id":"1-1"
+        # New format: a JSON array of season folders from videodb.stream/file/play
+        stripped = embed_html.lstrip()
+        if stripped.startswith('['):
+            try:
+                data = json.loads(embed_html)
+                for season_block in data:
+                    for ep in season_block.get('folder', []):
+                        ep_id = ep.get('id', '')
+                        file_str = ep.get('file', '')
+                        m = re.match(r'(\d+)-(\d+)', ep_id)
+                        if not (file_str and m):
+                            continue
+                        season = int(m.group(1))
+                        episode = int(m.group(2))
+                        if file_str.startswith('['):
+                            urls = self._parse_file_string(file_str, preferred_quality)
+                        else:
+                            # Plain URL — typically an HLS master. Tag as GEO since this is
+                            # ge.movie's Georgian-dubbed catalog (single audio per episode).
+                            urls = {'GEO': file_str}
+                        if urls:
+                            episodes[(season, episode)] = urls
+                            self.log(f"Found S{season}E{episode}: {list(urls.keys())}")
+                if episodes:
+                    return episodes
+            except (json.JSONDecodeError, ValueError, AttributeError) as e:
+                self.log(f"JSON parse failed: {e}")
+
+        # Legacy format: inline "file":"...","id":"S-E" pairs in embed HTML.
         episode_pattern = re.compile(
             r'"file"\s*:\s*"([^"]+)"[^}]*"id"\s*:\s*"(\d+)-(\d+)"',
-            re.DOTALL
+            re.DOTALL,
         )
-
         for match in episode_pattern.finditer(embed_html):
             file_str = match.group(1)
             season = int(match.group(2))
             episode = int(match.group(3))
-
             urls = self._parse_file_string(file_str, preferred_quality)
-
             if urls:
                 episodes[(season, episode)] = urls
                 self.log(f"Found S{season}E{episode}: {list(urls.keys())}")
@@ -441,8 +523,140 @@ class GEMovieDownloaderV2:
         except Exception:
             return False
 
+    @staticmethod
+    def _is_hls_url(url: str) -> bool:
+        return bool(re.search(r'\.(m3u8|txt)(\?|$)', url) or '/hls/' in url)
+
+    def _download_hls(self, url: str, output_path: Path, referer: Optional[str] = None) -> bool:
+        """Download an HLS stream via ffmpeg (stream-copy, no re-encoding).
+
+        Writes to {output_path}.partial during the run, then renames on success — that way
+        an interrupted run leaves a clearly-marked partial file that the next run discards.
+        """
+        if not shutil.which("ffmpeg"):
+            print("  Error: ffmpeg is required for HLS streams but is not in PATH")
+            return False
+
+        if output_path.exists():
+            print(f"  Already complete: {output_path.name}")
+            return True
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        partial_path = output_path.with_suffix(output_path.suffix + ".partial")
+        if partial_path.exists():
+            partial_path.unlink()
+
+        if referer is None:
+            host_match = re.match(r'(https?://[^/]+)/', url)
+            referer = (host_match.group(1) + "/") if host_match else "https://em.filmx.my/"
+
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostats",
+            "-progress", "pipe:1",      # machine-readable progress on stdout
+            "-headers", f"Referer: {referer}\r\nUser-Agent: {self.VIDEO_HEADERS['User-Agent']}\r\n",
+            "-extension_picky", "0",    # CDN segments use .js/.css/.woff to evade ad-blockers
+            "-f", "hls",                # force HLS demuxer; URL ends in .txt
+            "-i", url,
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            "-f", "mp4",                # explicit because the .partial extension hides .mp4
+            "-movflags", "+faststart",  # web-friendly atom layout
+            "-y",
+            str(partial_path),
+        ]
+        self.log(f"ffmpeg cmd: {' '.join(cmd)}")
+
+        # Known harmless noise from ffmpeg's HTTP layer when segments rotate across CDN hosts.
+        noise_patterns = (
+            "Cannot reuse HTTP connection",
+            "keepalive request failed",
+        )
+
+        print(f"  Streaming HLS (segments rotate across CDN hosts; this is normal)...")
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+
+            real_errors: list[str] = []
+
+            def drain_stderr() -> None:
+                assert proc.stderr is not None
+                for raw in proc.stderr:
+                    line = raw.rstrip()
+                    if not line or any(p in line for p in noise_patterns):
+                        continue
+                    real_errors.append(line)
+                    sys.stderr.write(f"  [ffmpeg] {line}\n")
+                    sys.stderr.flush()
+
+            t = threading.Thread(target=drain_stderr, daemon=True)
+            t.start()
+
+            last_size = 0
+            last_time = "00:00:00"
+            last_speed = ""
+            last_print = 0.0
+            assert proc.stdout is not None
+            for raw in proc.stdout:
+                line = raw.strip()
+                if not line or '=' not in line:
+                    continue
+                key, _, value = line.partition('=')
+                if key == 'total_size':
+                    try:
+                        last_size = int(value)
+                    except ValueError:
+                        pass
+                elif key == 'out_time':
+                    last_time = value.split('.')[0]
+                elif key == 'speed':
+                    last_speed = value
+                elif key == 'progress':
+                    now = time.monotonic()
+                    if value == 'end' or now - last_print >= 0.5:
+                        last_print = now
+                        size_mb = last_size / (1024 * 1024) if last_size else 0
+                        sys.stderr.write(
+                            f"\r  {output_path.name[:48]:<48}  "
+                            f"{size_mb:7.1f} MB  encoded {last_time}  {last_speed:<7}      "
+                        )
+                        sys.stderr.flush()
+                    if value == 'end':
+                        break
+
+            sys.stderr.write('\n')
+            sys.stderr.flush()
+            proc.wait()
+            t.join(timeout=2)
+
+            if proc.returncode == 0 and partial_path.exists():
+                partial_path.rename(output_path)
+                return True
+            return False
+        except KeyboardInterrupt:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            print("\n  Interrupted — partial file kept at:", partial_path)
+            raise
+        except Exception as e:
+            print(f"  ffmpeg error: {e}")
+            return False
+
     def download_video(self, url: str, output_path: Path, chunk_size: int = 1024 * 1024) -> bool:
-        """Download a video file with progress bar."""
+        """Download a video file with progress bar (or via ffmpeg for HLS)."""
+        if self._is_hls_url(url):
+            return self._download_hls(url, output_path)
         try:
             # Get file size with range header
             headers = self.VIDEO_HEADERS.copy()
